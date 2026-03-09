@@ -39,6 +39,15 @@ parser.add_argument('--patch', default='4', type=int, help="patch for ViT")
 parser.add_argument('--ckpt_dir', type=str, default=None,help='location for the pretrained CRATE weight')
 parser.add_argument('--data_dir', type=str, default='./data',help='location for datasets')
 
+parser.add_argument('--ole_mode', default='none', type=str, choices=['none', 'learned_t', 'solver_t'])
+parser.add_argument('--ole_loss_weight', default=0.0, type=float)
+parser.add_argument('--ole_lambda_sum', default=1.0, type=float)
+parser.add_argument('--ole_layers', default='last3', type=str)
+parser.add_argument('--ole_solver_step_size', default=0.1, type=float)
+parser.add_argument('--ole_solver_second_order', action='store_true')
+parser.add_argument('--ole_log_head_stats', action='store_true')
+parser.add_argument('--nuclear_norm_mode', default='exact', type=str)
+
 args = parser.parse_args()
 
 # take in args
@@ -76,10 +85,30 @@ print('==> Building model..')
 if args.ckpt_dir is None:
     print("Train from scratch.")
 if args.net == 'vit_tiny':
-    net = vit_tiny_patch16(global_pool=True)
+    net = vit_tiny_patch16(
+        global_pool=True,
+        ole_mode=args.ole_mode,
+        ole_loss_weight=args.ole_loss_weight,
+        ole_lambda_sum=args.ole_lambda_sum,
+        ole_layers=args.ole_layers,
+        ole_solver_step_size=args.ole_solver_step_size,
+        ole_solver_second_order=args.ole_solver_second_order,
+        ole_log_head_stats=args.ole_log_head_stats,
+        nuclear_norm_mode=args.nuclear_norm_mode,
+    )
     net.head = nn.Linear(192, args.classes)
 elif args.net == 'vit_small':
-    net = vit_small_patch16(global_pool=True)
+    net = vit_small_patch16(
+        global_pool=True,
+        ole_mode=args.ole_mode,
+        ole_loss_weight=args.ole_loss_weight,
+        ole_lambda_sum=args.ole_lambda_sum,
+        ole_layers=args.ole_layers,
+        ole_solver_step_size=args.ole_solver_step_size,
+        ole_solver_second_order=args.ole_solver_second_order,
+        ole_log_head_stats=args.ole_log_head_stats,
+        nuclear_norm_mode=args.nuclear_norm_mode,
+    )
     net.head = nn.Linear(384, args.classes)
 elif args.net == 'CRATE_tiny':
     net = CRATE_tiny(args.classes)
@@ -139,7 +168,11 @@ def train(epoch):
         # Train with amp
         with torch.cuda.amp.autocast(enabled=use_amp):
             outputs = net(inputs)
-            loss = criterion(outputs, targets)
+            task_loss = criterion(outputs, targets)
+            ole_aux = outputs.new_zeros(())
+            if args.net.startswith('vit') and args.ole_mode != 'none' and args.ole_loss_weight > 0:
+                ole_aux = net.module.get_aux_loss() if hasattr(net, 'module') else net.get_aux_loss()
+            loss = task_loss + args.ole_loss_weight * ole_aux
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -150,8 +183,12 @@ def train(epoch):
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
-        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-            % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+        progress_bar(batch_idx, len(trainloader), 'Task: %.3f | OLE: %.3f | Total: %.3f | Acc: %.3f%% (%d/%d)'
+            % (task_loss.item(), ole_aux.item(), loss.item(), 100.*correct/total, correct, total))
+        if args.net.startswith('vit') and args.ole_mode != 'none' and args.ole_log_head_stats and batch_idx % 100 == 0:
+            head_stats = net.module.get_ole_head_stats() if hasattr(net, 'module') else net.get_ole_head_stats()
+            if head_stats:
+                print(f'OLE head stats: {head_stats}')
     return train_loss/(batch_idx+1)
 
 ##### Validation
