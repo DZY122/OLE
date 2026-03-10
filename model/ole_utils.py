@@ -22,13 +22,16 @@ def spectral_normalize_matrix(matrix: torch.Tensor, n_power_iter: int = 2, eps: 
 def nuclear_norm_fn(matrix: torch.Tensor, mode: str = "exact", eps: float = 1e-8) -> torch.Tensor:
     if mode != "exact":
         raise ValueError(f"Unsupported nuclear norm mode: {mode}")
-    svals = torch.linalg.svdvals(matrix)
+    # torch.linalg.svdvals is not implemented for float16 on some CUDA backends.
+    matrix_svd = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
+    svals = torch.linalg.svdvals(matrix_svd)
     norm = svals.sum()
     return norm / math.sqrt(matrix.shape[1] + eps)
 
 
 def effective_rank(matrix: torch.Tensor, eps: float = 1e-8) -> float:
-    svals = torch.linalg.svdvals(matrix)
+    matrix_svd = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
+    svals = torch.linalg.svdvals(matrix_svd)
     total = svals.sum() + eps
     p = svals / total
     entropy = -(p * torch.log(p + eps)).sum()
