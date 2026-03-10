@@ -79,6 +79,14 @@ def get_args_parser():
                             'fastest way to use PyTorch for either single node or '
                             'multi node data parallel training')
     parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
+    parser.add_argument('--ole_mode', default='none', type=str, choices=['none', 'learned_t', 'solver_t'])
+    parser.add_argument('--ole_loss_weight', default=0.0, type=float)
+    parser.add_argument('--ole_lambda_sum', default=1.0, type=float)
+    parser.add_argument('--ole_layers', default='last3', type=str)
+    parser.add_argument('--ole_solver_step_size', default=0.1, type=float)
+    parser.add_argument('--ole_solver_second_order', action='store_true')
+    parser.add_argument('--ole_log_head_stats', action='store_true')
+    parser.add_argument('--nuclear_norm_mode', default='exact', type=str)
     return parser
 
 parser = get_args_parser()
@@ -146,9 +154,29 @@ def main_worker(gpu, ngpus_per_node, args):
     
     print('==> Building model: {}'.format(args.arch))
     if args.arch == 'vit_tiny':
-        model = vit_tiny_patch16(global_pool=True)
+        model = vit_tiny_patch16(
+            global_pool=True,
+            ole_mode=args.ole_mode,
+            ole_loss_weight=args.ole_loss_weight,
+            ole_lambda_sum=args.ole_lambda_sum,
+            ole_layers=args.ole_layers,
+            ole_solver_step_size=args.ole_solver_step_size,
+            ole_solver_second_order=args.ole_solver_second_order,
+            ole_log_head_stats=args.ole_log_head_stats,
+            nuclear_norm_mode=args.nuclear_norm_mode,
+        )
     elif args.arch == 'vit_small':
-        model = vit_small_patch16(global_pool=True)
+        model = vit_small_patch16(
+            global_pool=True,
+            ole_mode=args.ole_mode,
+            ole_loss_weight=args.ole_loss_weight,
+            ole_lambda_sum=args.ole_lambda_sum,
+            ole_layers=args.ole_layers,
+            ole_solver_step_size=args.ole_solver_step_size,
+            ole_solver_second_order=args.ole_solver_second_order,
+            ole_log_head_stats=args.ole_log_head_stats,
+            nuclear_norm_mode=args.nuclear_norm_mode,
+        )
     elif args.arch == 'CRATE_tiny':
         model = CRATE_tiny()
     elif args.arch == "CRATE_small":
@@ -325,12 +353,14 @@ grad_clip_norm = 1.0
 def train(train_loader, model, criterion, optimizer, epoch, device, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
+    losses = AverageMeter('TaskLoss', ':.4e')
+    ole_losses = AverageMeter('OLELoss', ':.4e')
+    total_losses = AverageMeter('TotalLoss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
+        [batch_time, data_time, losses, ole_losses, total_losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
@@ -348,11 +378,17 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         # compute output
         with autocast():
             output = model(images)
-            loss = criterion(output, target)
+            task_loss = criterion(output, target)
+            ole_aux = output.new_zeros(())
+            if args.arch.startswith('vit') and args.ole_mode != 'none' and args.ole_loss_weight > 0:
+                ole_aux = model.module.get_aux_loss() if hasattr(model, 'module') else model.get_aux_loss()
+            loss = task_loss + args.ole_loss_weight * ole_aux
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
+        losses.update(task_loss.item(), images.size(0))
+        ole_losses.update(ole_aux.item(), images.size(0))
+        total_losses.update(loss.item(), images.size(0))
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
 
@@ -369,6 +405,10 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         if i % args.print_freq == 0:
             progress.display(i + 1)
+            if args.arch.startswith('vit') and args.ole_mode != 'none' and args.ole_log_head_stats:
+                head_stats = model.module.get_ole_head_stats() if hasattr(model, 'module') else model.get_ole_head_stats()
+                if head_stats:
+                    print(f"OLE head stats: {head_stats}")
 
 
 def validate(val_loader, model, criterion, args):

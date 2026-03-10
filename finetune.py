@@ -38,6 +38,16 @@ parser.add_argument('--n_epochs', type=int, default='400')
 parser.add_argument('--patch', default='4', type=int, help="patch for ViT")
 parser.add_argument('--ckpt_dir', type=str, default=None,help='location for the pretrained CRATE weight')
 parser.add_argument('--data_dir', type=str, default='./data',help='location for datasets')
+parser.add_argument('--gpu_ids', type=str, default=None, help='comma-separated gpu ids for DataParallel, e.g. 0,1,2,3')
+
+parser.add_argument('--ole_mode', default='none', type=str, choices=['none', 'learned_t', 'solver_t'])
+parser.add_argument('--ole_loss_weight', default=0.0, type=float)
+parser.add_argument('--ole_lambda_sum', default=1.0, type=float)
+parser.add_argument('--ole_layers', default='last3', type=str)
+parser.add_argument('--ole_solver_step_size', default=0.1, type=float)
+parser.add_argument('--ole_solver_second_order', action='store_true')
+parser.add_argument('--ole_log_head_stats', action='store_true')
+parser.add_argument('--nuclear_norm_mode', default='exact', type=str)
 
 args = parser.parse_args()
 
@@ -76,10 +86,30 @@ print('==> Building model..')
 if args.ckpt_dir is None:
     print("Train from scratch.")
 if args.net == 'vit_tiny':
-    net = vit_tiny_patch16(global_pool=True)
+    net = vit_tiny_patch16(
+        global_pool=True,
+        ole_mode=args.ole_mode,
+        ole_loss_weight=args.ole_loss_weight,
+        ole_lambda_sum=args.ole_lambda_sum,
+        ole_layers=args.ole_layers,
+        ole_solver_step_size=args.ole_solver_step_size,
+        ole_solver_second_order=args.ole_solver_second_order,
+        ole_log_head_stats=args.ole_log_head_stats,
+        nuclear_norm_mode=args.nuclear_norm_mode,
+    )
     net.head = nn.Linear(192, args.classes)
 elif args.net == 'vit_small':
-    net = vit_small_patch16(global_pool=True)
+    net = vit_small_patch16(
+        global_pool=True,
+        ole_mode=args.ole_mode,
+        ole_loss_weight=args.ole_loss_weight,
+        ole_lambda_sum=args.ole_lambda_sum,
+        ole_layers=args.ole_layers,
+        ole_solver_step_size=args.ole_solver_step_size,
+        ole_solver_second_order=args.ole_solver_second_order,
+        ole_log_head_stats=args.ole_log_head_stats,
+        nuclear_norm_mode=args.nuclear_norm_mode,
+    )
     net.head = nn.Linear(384, args.classes)
 elif args.net == 'CRATE_tiny':
     net = CRATE_tiny(args.classes)
@@ -93,8 +123,16 @@ elif args.net == "CRATE_large":
 # For Multi-GPU
 if 'cuda' in device:
     print(device)
-    print("using data parallel")
-    net = torch.nn.DataParallel(net) # make parallel
+    if args.gpu_ids is not None:
+        gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(',') if x.strip()]
+    else:
+        gpu_ids = list(range(torch.cuda.device_count()))
+    print(f"using data parallel on gpus: {gpu_ids}")
+    if len(gpu_ids) > 1:
+        net = net.cuda(gpu_ids[0])
+        net = torch.nn.DataParallel(net, device_ids=gpu_ids)
+    else:
+        net = net.cuda(gpu_ids[0])
     if args.ckpt_dir is not None:
         #upd keys
         state_dict = torch.load(args.ckpt_dir)['state_dict']
@@ -139,7 +177,11 @@ def train(epoch):
         # Train with amp
         with torch.cuda.amp.autocast(enabled=use_amp):
             outputs = net(inputs)
-            loss = criterion(outputs, targets)
+            task_loss = criterion(outputs, targets)
+            ole_aux = outputs.new_zeros(())
+            if args.net.startswith('vit') and args.ole_mode != 'none' and args.ole_loss_weight > 0:
+                ole_aux = net.module.get_aux_loss() if hasattr(net, 'module') else net.get_aux_loss()
+            loss = task_loss + args.ole_loss_weight * ole_aux
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -150,8 +192,12 @@ def train(epoch):
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
-        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-            % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+        progress_bar(batch_idx, len(trainloader), 'Task: %.3f | OLE: %.3f | Total: %.3f | Acc: %.3f%% (%d/%d)'
+            % (task_loss.item(), ole_aux.item(), loss.item(), 100.*correct/total, correct, total))
+        if args.net.startswith('vit') and args.ole_mode != 'none' and args.ole_log_head_stats and batch_idx % 100 == 0:
+            head_stats = net.module.get_ole_head_stats() if hasattr(net, 'module') else net.get_ole_head_stats()
+            if head_stats:
+                print(f'OLE head stats: {head_stats}')
     return train_loss/(batch_idx+1)
 
 ##### Validation
@@ -197,7 +243,6 @@ def test(epoch):
 list_loss = []
 list_acc = []
 
-net.cuda()
 for epoch in range(start_epoch, args.n_epochs):
     start = time.time()
     trainloss = train(epoch)

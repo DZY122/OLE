@@ -232,3 +232,34 @@ For technical details and full experimental results, please check the [CRATE pap
   year={2023}
 }
 ```
+
+
+## Multi-GPU pretraining / fine-tuning / inference
+
+### Multi-GPU pretraining (ImageNet)
+`main.py` already supports distributed training. Example (8 GPUs, single node):
+```bash
+torchrun --nproc_per_node=8 main.py \
+  --data DATA_DIR --arch vit_tiny --batch-size 512 --epochs 90 \
+  --multiprocessing-distributed --world-size 1 --rank 0
+```
+
+### Multi-GPU fine-tuning (CIFAR10)
+`finetune.py` supports selecting multiple GPUs via `--gpu_ids` for DataParallel:
+```bash
+python finetune.py \
+  --data cifar10 --data_dir DATA_DIR --net vit_tiny --bs 256 \
+  --gpu_ids 0,1,2,3 --ole_mode learned_t --ole_loss_weight 0.1
+```
+
+### Multi-GPU inference / evaluation
+Use `tools/inference.py` (supports DataParallel and DDP with `torchrun`):
+```bash
+# DataParallel
+python tools/inference.py \
+  --data DATA_DIR --checkpoint CKPT --arch vit_tiny --gpu_ids 0,1,2,3
+
+# DDP
+torchrun --nproc_per_node=8 tools/inference.py \
+  --distributed --data DATA_DIR --checkpoint CKPT --arch vit_tiny
+```
