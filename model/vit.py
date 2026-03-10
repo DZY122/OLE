@@ -69,6 +69,11 @@ class OLEAttention(timm.models.vision_transformer.Attention):
         if self.ole_mode == "learned_t":
             return t_base, self._compute_layer_ole(out_heads, t_base)
         if self.ole_mode == "solver_t":
+            # In eval/no_grad paths (e.g. validation), autograd.grad is unavailable.
+            # Fallback to base transform while still reporting the auxiliary objective.
+            if (not torch.is_grad_enabled()) or (not out_heads.requires_grad):
+                return t_base, self._compute_layer_ole(out_heads, t_base)
+
             local_obj = self._compute_layer_ole(out_heads, t_base)
             grad_t = torch.autograd.grad(
                 local_obj,
