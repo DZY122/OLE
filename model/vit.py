@@ -62,7 +62,7 @@ class OLEAttention(timm.models.vision_transformer.Attention):
             }
         return head_terms.sum() - sum_term
         # return head_terms.mean() - self.ole_lambda_sum * sum_term
-
+    
     def _get_t_eff(self, out_heads: torch.Tensor):
         if not self._ole_enabled:
             return None, None
@@ -70,6 +70,11 @@ class OLEAttention(timm.models.vision_transformer.Attention):
         if self.ole_mode == "learned_t":
             return t_base, self._compute_layer_ole(out_heads, t_base)
         if self.ole_mode == "solver_t":
+            # In eval/no_grad paths (e.g. validation), autograd.grad is unavailable.
+            # Fallback to base transform while still reporting the auxiliary objective.
+            if (not torch.is_grad_enabled()) or (not out_heads.requires_grad):
+                return t_base, self._compute_layer_ole(out_heads, t_base)
+
             local_obj = self._compute_layer_ole(out_heads, t_base)
             grad_t = torch.autograd.grad(
                 local_obj,
@@ -82,6 +87,27 @@ class OLEAttention(timm.models.vision_transformer.Attention):
             t_eff = spectral_normalize_matrix(t_base - self.ole_solver_step_size * grad_t_used)
             return t_eff, self._compute_layer_ole(out_heads, t_eff)
         raise ValueError(f"Unsupported ole_mode: {self.ole_mode}")
+    
+
+    # def _get_t_eff(self, out_heads: torch.Tensor):
+    #     if not self._ole_enabled:
+    #         return None, None
+    #     t_base = spectral_normalize_matrix(self.ole_t)
+    #     if self.ole_mode == "learned_t":
+    #         return t_base, self._compute_layer_ole(out_heads, t_base)
+    #     if self.ole_mode == "solver_t":
+    #         local_obj = self._compute_layer_ole(out_heads, t_base)
+    #         grad_t = torch.autograd.grad(
+    #             local_obj,
+    #             t_base,
+    #             retain_graph=True,
+    #             create_graph=self.ole_solver_second_order,
+    #             allow_unused=False,
+    #         )[0]
+    #         grad_t_used = grad_t if self.ole_solver_second_order else grad_t.detach()
+    #         t_eff = spectral_normalize_matrix(t_base - self.ole_solver_step_size * grad_t_used)
+    #         return t_eff, self._compute_layer_ole(out_heads, t_eff)
+    #     raise ValueError(f"Unsupported ole_mode: {self.ole_mode}")
 
     def forward(self, x: torch.Tensor, attn_mask=None) -> torch.Tensor:
         B, N, _ = x.shape
