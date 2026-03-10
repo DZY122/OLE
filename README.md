@@ -240,17 +240,20 @@ For technical details and full experimental results, please check the [CRATE pap
 `main.py` already supports distributed training. Example (8 GPUs, single node):
 ```bash
 torchrun --nproc_per_node=8 main.py \
-  --data DATA_DIR --arch vit_tiny --batch-size 512 --epochs 90 \
-  --multiprocessing-distributed --world-size 1 --rank 0
+  --data DATA_DIR --arch vit_tiny --batch-size 512 --epochs 90
 ```
+
+`torchrun` 会自动注入分布式环境变量，因此不需要再手动传 `--multiprocessing-distributed --world-size 1 --rank 0`。
 
 ### Multi-GPU fine-tuning (CIFAR10)
 `finetune.py` supports selecting multiple GPUs via `--gpu_ids` for DataParallel:
 ```bash
 torchrun --nproc_per_node=8 finetune.py \
   --distributed --data cifar10 --data_dir DATA_DIR --net vit_tiny --bs 256 \
-  --ole_mode learned_t --ole_loss_weight 0.1
+  --ole_mode learned_t --ole_loss_weight 0.1 --workers 4
 ```
+
+如果你遇到数据加载卡住（worker hang），先把 `--workers` 调低到 `0~4`，通常可以避免多进程 DataLoader 在不同环境下的锁死。
 
 ### Multi-GPU inference / evaluation
 Use `tools/inference.py` (supports DataParallel and DDP with `torchrun`):

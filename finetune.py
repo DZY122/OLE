@@ -19,6 +19,12 @@ from model.vit import *
 from data.dataset import *
 
 
+if __name__ == '__main__':
+    try:
+        torch.multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
 parser.add_argument('--opt', default='adamW')
@@ -38,6 +44,7 @@ parser.add_argument('--data_dir', type=str, default='./data', help='location for
 parser.add_argument('--gpu_ids', type=str, default=None, help='comma-separated gpu ids for DataParallel, e.g. 0,1,2,3')
 parser.add_argument('--distributed', action='store_true', help='enable DDP; compatible with torchrun')
 parser.add_argument('--dist_backend', type=str, default='nccl')
+parser.add_argument('--workers', type=int, default=4, help='data loading workers per process')
 
 parser.add_argument('--ole_mode', default='none', type=str, choices=['none', 'learned_t', 'solver_t'])
 parser.add_argument('--ole_loss_weight', default=0.0, type=float)
@@ -114,6 +121,7 @@ is_distributed, local_rank, device = setup_distributed()
 
 if is_main_process():
     print('==> Preparing data..')
+    print(f'workers per process: {args.workers}')
 size = 224
 transform_train = transforms.Compose([
     transforms.RandomResizedCrop((size, size)),
@@ -141,19 +149,25 @@ train_sampler = torch.utils.data.distributed.DistributedSampler(transet) if is_d
 test_sampler = torch.utils.data.distributed.DistributedSampler(testset, shuffle=False) if is_distributed else None
 
 batch_size = args.bs if not is_distributed else max(1, args.bs // dist.get_world_size())
+loader_workers = max(args.workers, 0)
+loader_kwargs = {
+    'num_workers': loader_workers,
+    'pin_memory': device.type == 'cuda',
+    'persistent_workers': loader_workers > 0,
+}
 trainloader = torch.utils.data.DataLoader(
     transet,
     batch_size=batch_size,
     shuffle=(train_sampler is None),
     sampler=train_sampler,
-    num_workers=8,
+    **loader_kwargs,
 )
 testloader = torch.utils.data.DataLoader(
     testset,
     batch_size=100,
     shuffle=False,
     sampler=test_sampler,
-    num_workers=8,
+    **loader_kwargs,
 )
 
 if is_main_process():

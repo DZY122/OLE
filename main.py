@@ -98,6 +98,14 @@ scaler = GradScaler()
 def main():
     args = parser.parse_args()
 
+    if "LOCAL_RANK" in os.environ:
+        # torchrun mode: avoid nested mp.spawn that can cause dataloader hangs.
+        args.gpu = int(os.environ["LOCAL_RANK"])
+        args.rank = int(os.environ.get("RANK", 0))
+        args.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        args.dist_url = "env://"
+        args.multiprocessing_distributed = False
+
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
