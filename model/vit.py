@@ -60,7 +60,8 @@ class OLEAttention(timm.models.vision_transformer.Attention):
                 "sum_nuclear": sum_term.detach().item(),
                 "head_cosine": mean_pairwise_cosine(x.detach()).item(),
             }
-        return head_terms.mean() - self.ole_lambda_sum * sum_term
+        return head_terms.sum() - sum_term
+        # return head_terms.mean() - self.ole_lambda_sum * sum_term
 
     def _get_t_eff(self, out_heads: torch.Tensor):
         if not self._ole_enabled:
