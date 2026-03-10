@@ -247,9 +247,9 @@ torchrun --nproc_per_node=8 main.py \
 ### Multi-GPU fine-tuning (CIFAR10)
 `finetune.py` supports selecting multiple GPUs via `--gpu_ids` for DataParallel:
 ```bash
-python finetune.py \
-  --data cifar10 --data_dir DATA_DIR --net vit_tiny --bs 256 \
-  --gpu_ids 0,1,2,3 --ole_mode learned_t --ole_loss_weight 0.1
+torchrun --nproc_per_node=8 finetune.py \
+  --distributed --data cifar10 --data_dir DATA_DIR --net vit_tiny --bs 256 \
+  --ole_mode learned_t --ole_loss_weight 0.1
 ```
 
 ### Multi-GPU inference / evaluation
