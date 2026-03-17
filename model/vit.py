@@ -218,34 +218,27 @@ class OLEAttention(timm.models.vision_transformer.Attention):
 
         # 1) linearize the concave term at current T^(t)
         with torch.no_grad():
-            a_all = t_base.detach() @ y_all                                # [D, HBN]
-            g_a = nuclear_norm_subgrad(a_all, delta=self.ole_subgrad_delta)  # [D, HBN]
-            m = self.ole_lambda_sum * (g_a @ y_all.transpose(0, 1))        # [D, D]
+            a_all = t_base.detach() @ y_all                                   # [D, HBN]
+            g_a = nuclear_norm_subgrad(a_all, delta=self.ole_subgrad_delta)   # [D, HBN]
+            m = self.ole_lambda_sum * (g_a @ y_all.transpose(0, 1))           # [D, D]
 
-        # 2) one step on surrogate:
-        #    sum_h ||T Y_h||_* - trace(M^T T)
-        within = 0.0
-        for i in range(y_heads.shape[0]):
-            within = within + nuclear_norm_fn(
-                t_base @ y_heads[i],
-                mode=self.nuclear_norm_mode,
-                approx_rank=self.ole_nuclear_rank,
-            )
+            # 2) explicit subgradient for sum_h ||T Y_h||_* term:
+            #    if G_h in ∂||T Y_h||_*, then
+            #      ∂_T ||T Y_h||_* contains G_h Y_h^T
+            grad_within = torch.zeros_like(t_base)
+            for i in range(y_heads.shape[0]):
+                a_h = t_base.detach() @ y_heads[i]                            # [D, BN]
+                g_h = nuclear_norm_subgrad(a_h, delta=self.ole_subgrad_delta) # [D, BN]
+                grad_within = grad_within + (g_h @ y_heads[i].transpose(0, 1))
 
-        lin = -(m * t_base).sum()   # = -trace(M^T T)
-        surrogate = within + lin
+            # surrogate gradient:
+            #   ∂_T [sum_h ||T Y_h||_* - trace(M^T T)] = grad_within - M
+            grad_t = grad_within - m
 
-        grad_t = torch.autograd.grad(
-            surrogate,
-            t_base,
-            retain_graph=False,
-            create_graph=False,
-            allow_unused=False,
-        )[0]
+            # no spectral normalization
+            t_eff = t_base.detach() - self.ole_solver_step_size * grad_t
 
-        # no spectral normalization
-        t_eff = t_base - self.ole_solver_step_size * grad_t.detach()
-        return t_eff
+        return t_eff.to(t_base.dtype)
 
     def _should_update_t_this_forward(self) -> bool:
         return bool((self._ole_forward_count.remainder(self.ole_update_interval) == 0).item())
