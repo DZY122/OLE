@@ -209,12 +209,19 @@ def main_worker(gpu, ngpus_per_node, args):
                 # ourselves based on the total number of GPUs of the current node.
                 args.batch_size = int(args.batch_size / ngpus_per_node)
                 args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+                model = torch.nn.parallel.DistributedDataParallel(
+                    model,
+                    device_ids=[args.gpu],
+                    find_unused_parameters=True,
+                )
             else:
                 model.cuda()
                 # DistributedDataParallel will divide and allocate batch_size to all
                 # available GPUs if device_ids are not set
-                model = torch.nn.parallel.DistributedDataParallel(model)
+                model = torch.nn.parallel.DistributedDataParallel(
+                    model,
+                    find_unused_parameters=True,
+                )
     elif args.gpu is not None and torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
@@ -353,6 +360,9 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer' : optimizer.state_dict(),
                 'scheduler' : scheduler.state_dict()
             }, is_best)
+
+    if args.distributed and dist.is_initialized():
+        dist.destroy_process_group()
 
 grad_clip_norm = 1.0
 def train(train_loader, model, criterion, optimizer, epoch, device, args):
