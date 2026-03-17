@@ -16,24 +16,28 @@ from model.ole_utils import spectral_normalize_matrix
 
 
 def nuclear_norm_fn(matrix: torch.Tensor, mode: str = "exact", eps: float = 1e-8, approx_rank: int = 8) -> torch.Tensor:
-    # torch.linalg.svdvals is not implemented for float16 on some CUDA backends.
-    matrix_svd = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
+    orig_dtype = matrix.dtype
 
     if mode == "exact":
+        # torch.linalg.svdvals is not implemented for float16 on some CUDA backends.
+        matrix_svd = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
         svals = torch.linalg.svdvals(matrix_svd)
-        norm = svals.sum()
-        return norm / math.sqrt(matrix.shape[1] + eps)
+        norm = svals.sum() / math.sqrt(matrix.shape[1] + eps)
+        return norm.to(orig_dtype) if orig_dtype in (torch.float16, torch.bfloat16) else norm
 
     if mode == "approx":
-        m, n = matrix_svd.shape
+        # Run randomized range finder + QR/SVD in FP32 to avoid Half geqrf limitation,
+        # then cast scalar back to the original dtype for compatibility.
+        matrix_fp32 = matrix.float()
+        m, n = matrix_fp32.shape
         k = max(1, min(int(approx_rank), m, n))
-        omega = torch.randn(n, k, device=matrix_svd.device, dtype=matrix_svd.dtype)
-        y = matrix_svd @ omega
+        omega = torch.randn(n, k, device=matrix_fp32.device, dtype=matrix_fp32.dtype)
+        y = matrix_fp32 @ omega
         q, _ = torch.linalg.qr(y, mode="reduced")
-        b = q.transpose(0, 1) @ matrix_svd
+        b = q.transpose(0, 1) @ matrix_fp32
         svals = torch.linalg.svdvals(b)
-        norm = svals.sum()
-        return norm / math.sqrt(matrix.shape[1] + eps)
+        norm = svals.sum() / math.sqrt(matrix.shape[1] + eps)
+        return norm.to(orig_dtype) if orig_dtype in (torch.float16, torch.bfloat16) else norm
 
     raise ValueError(f"Unsupported nuclear norm mode: {mode}")
 
