@@ -47,6 +47,8 @@ parser.add_argument('--ole_solver_step_size', default=0.1, type=float)
 parser.add_argument('--ole_solver_second_order', action='store_true')
 parser.add_argument('--ole_log_head_stats', action='store_true')
 parser.add_argument('--nuclear_norm_mode', default='exact', type=str)
+parser.add_argument('--ole_update_interval', default=1, type=int)
+parser.add_argument('--ole_nuclear_rank', default=8, type=int)
 
 args = parser.parse_args()
 
@@ -95,6 +97,8 @@ if args.net == 'vit_tiny':
         ole_solver_second_order=args.ole_solver_second_order,
         ole_log_head_stats=args.ole_log_head_stats,
         nuclear_norm_mode=args.nuclear_norm_mode,
+        ole_update_interval=args.ole_update_interval,
+        ole_nuclear_rank=args.ole_nuclear_rank,
     )
     net.head = nn.Linear(192, args.classes)
 elif args.net == 'vit_small':
@@ -108,6 +112,8 @@ elif args.net == 'vit_small':
         ole_solver_second_order=args.ole_solver_second_order,
         ole_log_head_stats=args.ole_log_head_stats,
         nuclear_norm_mode=args.nuclear_norm_mode,
+        ole_update_interval=args.ole_update_interval,
+        ole_nuclear_rank=args.ole_nuclear_rank,
     )
     net.head = nn.Linear(384, args.classes)
 elif args.net == 'CRATE_tiny':

@@ -12,32 +12,30 @@ import torch.nn.functional as F
 import timm.models.vision_transformer
 from timm.layers.attention import maybe_add_mask
 
-from model.ole_utils import mean_pairwise_cosine, nuclear_norm_fn, spectral_normalize_matrix
+from model.ole_utils import spectral_normalize_matrix
 
 
-def spectral_normalize_matrix(matrix: torch.Tensor, n_power_iter: int = 2, eps: float = 1e-6) -> torch.Tensor:
-    if matrix.ndim != 2:
-        raise ValueError("spectral_normalize_matrix expects a 2D tensor")
-    with torch.no_grad():
-        v = torch.randn(matrix.shape[1], device=matrix.device, dtype=matrix.dtype)
-        v = v / (v.norm() + eps)
-        for _ in range(max(1, n_power_iter)):
-            u = matrix @ v
-            u = u / (u.norm() + eps)
-            v = matrix.transpose(0, 1) @ u
-            v = v / (v.norm() + eps)
-        sigma = (u * (matrix @ v)).sum().abs()
-    return matrix / (sigma + eps)
-
-
-def nuclear_norm_fn(matrix: torch.Tensor, mode: str = "exact", eps: float = 1e-8) -> torch.Tensor:
-    if mode != "exact":
-        raise ValueError(f"Unsupported nuclear norm mode: {mode}")
+def nuclear_norm_fn(matrix: torch.Tensor, mode: str = "exact", eps: float = 1e-8, approx_rank: int = 8) -> torch.Tensor:
     # torch.linalg.svdvals is not implemented for float16 on some CUDA backends.
     matrix_svd = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
-    svals = torch.linalg.svdvals(matrix_svd)
-    norm = svals.sum()
-    return norm / math.sqrt(matrix.shape[1] + eps)
+
+    if mode == "exact":
+        svals = torch.linalg.svdvals(matrix_svd)
+        norm = svals.sum()
+        return norm / math.sqrt(matrix.shape[1] + eps)
+
+    if mode == "approx":
+        m, n = matrix_svd.shape
+        k = max(1, min(int(approx_rank), m, n))
+        omega = torch.randn(n, k, device=matrix_svd.device, dtype=matrix_svd.dtype)
+        y = matrix_svd @ omega
+        q, _ = torch.linalg.qr(y, mode="reduced")
+        b = q.transpose(0, 1) @ matrix_svd
+        svals = torch.linalg.svdvals(b)
+        norm = svals.sum()
+        return norm / math.sqrt(matrix.shape[1] + eps)
+
+    raise ValueError(f"Unsupported nuclear norm mode: {mode}")
 
 
 def effective_rank(matrix: torch.Tensor, eps: float = 1e-8) -> float:
@@ -49,13 +47,31 @@ def effective_rank(matrix: torch.Tensor, eps: float = 1e-8) -> float:
     return torch.exp(entropy).item()
 
 
-def mean_pairwise_cosine(head_features: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    # head_features: [H, M, D]
-    h = head_features.shape[0]
-    flat = head_features.reshape(h, -1)
-    flat = flat / (flat.norm(dim=1, keepdim=True) + eps)
-    sim = flat @ flat.transpose(0, 1)
-    return (sim.sum() - torch.diag(sim).sum()) / max(h * (h - 1), 1)
+def centered_mean_pairwise_cosine(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    x: [H, M, D]
+       H = num_heads
+       M = B*N (sample axis)
+       D = head_dim
+
+    For each head:
+      1) subtract mean over M
+      2) flatten to [H, M*D]
+      3) compute pairwise cosine
+      4) return mean off-diagonal cosine
+    """
+    h = x.shape[0]
+    if h <= 1:
+        return x.new_tensor(0.0)
+
+    x = x.float()
+    x_centered = x - x.mean(dim=1, keepdim=True)
+    x_flat = x_centered.reshape(h, -1)
+    x_flat = x_flat / x_flat.norm(dim=1, keepdim=True).clamp_min(eps)
+    sim = x_flat @ x_flat.transpose(0, 1)
+
+    mask = ~torch.eye(h, dtype=torch.bool, device=sim.device)
+    return sim[mask].mean().abs_()
 
 
 class Identity(nn.Module):
@@ -97,18 +113,22 @@ class OLEAttention(timm.models.vision_transformer.Attention):
         self.ole_solver_step_size = ole_config.get("ole_solver_step_size", 1e-3)
 
         self.nuclear_norm_mode = ole_config.get("nuclear_norm_mode", "exact")
+        self.ole_nuclear_rank = ole_config.get("ole_nuclear_rank", 8)
         self.ole_log_head_stats = ole_config.get("ole_log_head_stats", False)
         self.selected_layers = set(ole_config.get("ole_layers", []))
         self.ole_subgrad_delta = ole_config.get("ole_subgrad_delta", 1e-6)
 
         # alternating-style: solve T on fixed current features
         self.ole_detach_solver_features = ole_config.get("ole_detach_solver_features", True)
+        # 每多少个 train forward 更新一次 T
+        self.ole_update_interval = max(1, int(ole_config.get("ole_update_interval", 1)))
 
         self._ole_enabled = self.ole_mode != "none" and self.layer_index in self.selected_layers
         self.last_ole_loss = None
         self.last_ole_stats = {}
         self.last_out_heads = None
         self.last_t_eff = None
+        self.register_buffer("_ole_forward_count", torch.zeros((), dtype=torch.long), persistent=False)
 
         if self._ole_enabled:
             eye = torch.eye(self.head_dim)
@@ -145,18 +165,31 @@ class OLEAttention(timm.models.vision_transformer.Attention):
         ty_heads = torch.matmul(t_eff.unsqueeze(0), y_heads)   # [H, D, B*N]
 
         head_terms = torch.stack(
-            [nuclear_norm_fn(ty_heads[i], mode=self.nuclear_norm_mode) for i in range(ty_heads.shape[0])],
+            [
+                nuclear_norm_fn(
+                    ty_heads[i],
+                    mode=self.nuclear_norm_mode,
+                    approx_rank=self.ole_nuclear_rank,
+                )
+                for i in range(ty_heads.shape[0])
+            ],
             dim=0,
         )
 
-        union_term = nuclear_norm_fn(t_eff @ y_all, mode=self.nuclear_norm_mode)
+        union_term = nuclear_norm_fn(
+            t_eff @ y_all,
+            mode=self.nuclear_norm_mode,
+            approx_rank=self.ole_nuclear_rank,
+        )
 
         if self.ole_log_head_stats:
             x = ty_heads.permute(0, 2, 1).contiguous()  # [H, B*N, D]
+            centered_cos = centered_mean_pairwise_cosine(x.detach())
             self.last_ole_stats = {
                 "head_nuclear": head_terms.mean().detach().item(),
                 "union_nuclear": union_term.detach().item(),
-                "head_cosine": mean_pairwise_cosine(x.detach()).item(),
+                "head_cosine": centered_cos.item(),
+                "head_centered_cosine": centered_cos.item(),
             }
 
         return head_terms.sum() - self.ole_lambda_sum * union_term
@@ -193,7 +226,11 @@ class OLEAttention(timm.models.vision_transformer.Attention):
         #    sum_h ||T Y_h||_* - trace(M^T T)
         within = 0.0
         for i in range(y_heads.shape[0]):
-            within = within + nuclear_norm_fn(t_base @ y_heads[i], mode=self.nuclear_norm_mode)
+            within = within + nuclear_norm_fn(
+                t_base @ y_heads[i],
+                mode=self.nuclear_norm_mode,
+                approx_rank=self.ole_nuclear_rank,
+            )
 
         lin = -(m * t_base).sum()   # = -trace(M^T T)
         surrogate = within + lin
@@ -210,6 +247,9 @@ class OLEAttention(timm.models.vision_transformer.Attention):
         t_eff = t_base - self.ole_solver_step_size * grad_t.detach()
         return t_eff
 
+    def _should_update_t_this_forward(self) -> bool:
+        return bool((self._ole_forward_count.remainder(self.ole_update_interval) == 0).item())
+
     def _get_t_eff(self, out_heads: torch.Tensor):
         if not self._ole_enabled:
             return None, None
@@ -225,22 +265,23 @@ class OLEAttention(timm.models.vision_transformer.Attention):
             if (not self.training) or (not torch.is_grad_enabled()):
                 return t_base, self._compute_layer_ole(out_heads, t_base)
 
-            # train-time: one-step CCCP
-            t_eff = self._cccp_one_step(out_heads, t_base)
+            should_update = self._should_update_t_this_forward()
+            self._ole_forward_count.add_(1)
 
-            # 关键修改 1:
-            # 立刻把这一步的结果写回 self.ole_t，
-            # 让下一次 forward 真正从新的 T 出发
-            with torch.no_grad():
-                self.ole_t.copy_(t_eff.detach())
+            if should_update:
+                t_eff = self._cccp_one_step(out_heads, t_base)
 
-            self.last_t_eff = t_eff.detach()
+                with torch.no_grad():
+                    self.ole_t.copy_(t_eff.detach())
 
-            # 用更新后的 T 评估当前 true DC objective
-            layer_ole = self._compute_layer_ole(out_heads, t_eff.detach())
+                self.last_t_eff = t_eff.detach()
+                t_use = t_eff.detach()
+            else:
+                self.last_t_eff = t_base.detach()
+                t_use = t_base.detach()
 
-            # 这里返回 detach 后的 T，作为当前 batch 的常量变换使用
-            return t_eff.detach(), layer_ole
+            layer_ole = self._compute_layer_ole(out_heads, t_use)
+            return t_use, layer_ole
 
         raise ValueError(f"Unsupported ole_mode: {self.ole_mode}")
 
@@ -330,6 +371,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         ole_solver_second_order=False,
         ole_log_head_stats=False,
         nuclear_norm_mode="exact",
+        ole_update_interval=1,
+        ole_nuclear_rank=8,
         **kwargs,
     ):
         depth = kwargs.get("depth", 12)
@@ -343,6 +386,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             "ole_log_head_stats": ole_log_head_stats,
             "ole_layers": selected_layers,
             "nuclear_norm_mode": nuclear_norm_mode,
+            "ole_update_interval": ole_update_interval,
+            "ole_nuclear_rank": ole_nuclear_rank,
         }
         super(VisionTransformer, self).__init__(
             block_fn=partial(OLEBlock, ole_config=ole_cfg),

@@ -87,6 +87,8 @@ def get_args_parser():
     parser.add_argument('--ole_solver_second_order', action='store_true')
     parser.add_argument('--ole_log_head_stats', action='store_true')
     parser.add_argument('--nuclear_norm_mode', default='exact', type=str)
+    parser.add_argument('--ole_update_interval', default=1, type=int)
+    parser.add_argument('--ole_nuclear_rank', default=8, type=int)
     return parser
 
 parser = get_args_parser()
@@ -164,6 +166,8 @@ def main_worker(gpu, ngpus_per_node, args):
             ole_solver_second_order=args.ole_solver_second_order,
             ole_log_head_stats=args.ole_log_head_stats,
             nuclear_norm_mode=args.nuclear_norm_mode,
+            ole_update_interval=args.ole_update_interval,
+            ole_nuclear_rank=args.ole_nuclear_rank,
         )
     elif args.arch == 'vit_small':
         model = vit_small_patch16(
@@ -176,6 +180,8 @@ def main_worker(gpu, ngpus_per_node, args):
             ole_solver_second_order=args.ole_solver_second_order,
             ole_log_head_stats=args.ole_log_head_stats,
             nuclear_norm_mode=args.nuclear_norm_mode,
+            ole_update_interval=args.ole_update_interval,
+            ole_nuclear_rank=args.ole_nuclear_rank,
         )
     elif args.arch == 'CRATE_tiny':
         model = CRATE_tiny()
