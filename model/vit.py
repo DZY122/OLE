@@ -2,6 +2,7 @@
 # All rights reserved.
 
 import math
+from contextlib import nullcontext
 from functools import partial
 from typing import Dict, List
 
@@ -28,15 +29,17 @@ def nuclear_norm_fn(matrix: torch.Tensor, mode: str = "exact", eps: float = 1e-8
     if mode == "approx":
         # Run randomized range finder + QR/SVD in FP32 to avoid Half geqrf limitation,
         # then cast scalar back to the original dtype for compatibility.
-        matrix_fp32 = matrix.float()
-        m, n = matrix_fp32.shape
-        k = max(1, min(int(approx_rank), m, n))
-        omega = torch.randn(n, k, device=matrix_fp32.device, dtype=matrix_fp32.dtype)
-        y = matrix_fp32 @ omega
-        q, _ = torch.linalg.qr(y, mode="reduced")
-        b = q.transpose(0, 1) @ matrix_fp32
-        svals = torch.linalg.svdvals(b)
-        norm = svals.sum() / math.sqrt(matrix.shape[1] + eps)
+        amp_ctx = torch.cuda.amp.autocast(enabled=False) if matrix.is_cuda else nullcontext()
+        with amp_ctx:
+            matrix_fp32 = matrix.float()
+            m, n = matrix_fp32.shape
+            k = max(1, min(int(approx_rank), m, n))
+            omega = torch.randn(n, k, device=matrix_fp32.device, dtype=matrix_fp32.dtype)
+            y = matrix_fp32 @ omega
+            q, _ = torch.linalg.qr(y, mode="reduced")
+            b = q.transpose(0, 1) @ matrix_fp32
+            svals = torch.linalg.svdvals(b)
+            norm = svals.sum() / math.sqrt(matrix.shape[1] + eps)
         return norm.to(orig_dtype) if orig_dtype in (torch.float16, torch.bfloat16) else norm
 
     raise ValueError(f"Unsupported nuclear norm mode: {mode}")
