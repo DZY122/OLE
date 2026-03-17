@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
+import math
+from contextlib import nullcontext
 from functools import partial
 from typing import Dict, List
 
@@ -11,7 +13,73 @@ import torch.nn.functional as F
 import timm.models.vision_transformer
 from timm.layers.attention import maybe_add_mask
 
-from model.ole_utils import mean_pairwise_cosine, nuclear_norm_fn, spectral_normalize_matrix
+from model.ole_utils import spectral_normalize_matrix
+
+
+def nuclear_norm_fn(matrix: torch.Tensor, mode: str = "exact", eps: float = 1e-8, approx_rank: int = 8) -> torch.Tensor:
+    # Keep a stable local dtype alias so cast-back never depends on outer scope edits.
+    return_dtype = matrix.dtype
+
+    if mode == "exact":
+        # torch.linalg.svdvals is not implemented for float16 on some CUDA backends.
+        matrix_svd = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
+        svals = torch.linalg.svdvals(matrix_svd)
+        norm = svals.sum() / math.sqrt(matrix.shape[1] + eps)
+        return norm.to(return_dtype) if return_dtype in (torch.float16, torch.bfloat16) else norm
+
+    if mode == "approx":
+        # Run randomized range finder + QR/SVD in FP32 to avoid Half geqrf limitation,
+        # then cast scalar back to the original dtype for compatibility.
+        amp_ctx = torch.cuda.amp.autocast(enabled=False) if matrix.is_cuda else nullcontext()
+        with amp_ctx:
+            matrix_fp32 = matrix.float()
+            m, n = matrix_fp32.shape
+            k = max(1, min(int(approx_rank), m, n))
+            omega = torch.randn(n, k, device=matrix_fp32.device, dtype=matrix_fp32.dtype)
+            y = matrix_fp32 @ omega
+            q, _ = torch.linalg.qr(y, mode="reduced")
+            b = q.transpose(0, 1) @ matrix_fp32
+            svals = torch.linalg.svdvals(b)
+            norm = svals.sum() / math.sqrt(matrix.shape[1] + eps)
+        return norm.to(return_dtype) if return_dtype in (torch.float16, torch.bfloat16) else norm
+
+    raise ValueError(f"Unsupported nuclear norm mode: {mode}")
+
+
+def effective_rank(matrix: torch.Tensor, eps: float = 1e-8) -> float:
+    matrix_svd = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
+    svals = torch.linalg.svdvals(matrix_svd)
+    total = svals.sum() + eps
+    p = svals / total
+    entropy = -(p * torch.log(p + eps)).sum()
+    return torch.exp(entropy).item()
+
+
+def centered_mean_pairwise_cosine(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    x: [H, M, D]
+       H = num_heads
+       M = B*N (sample axis)
+       D = head_dim
+
+    For each head:
+      1) subtract mean over M
+      2) flatten to [H, M*D]
+      3) compute pairwise cosine
+      4) return mean off-diagonal cosine
+    """
+    h = x.shape[0]
+    if h <= 1:
+        return x.new_tensor(0.0)
+
+    x = x.float()
+    x_centered = x - x.mean(dim=1, keepdim=True)
+    x_flat = x_centered.reshape(h, -1)
+    x_flat = x_flat / x_flat.norm(dim=1, keepdim=True).clamp_min(eps)
+    sim = x_flat @ x_flat.transpose(0, 1)
+
+    mask = ~torch.eye(h, dtype=torch.bool, device=sim.device)
+    return sim[mask].mean().abs_()
 
 
 class Identity(nn.Module):
@@ -22,6 +90,25 @@ class Identity(nn.Module):
         return x
 
 
+def nuclear_norm_subgrad(A: torch.Tensor, delta: float = 1e-6) -> torch.Tensor:
+    """
+    One simple valid subgradient of ||A||_*:
+        G = U_r V_r^T
+    where r counts singular values > delta.
+
+    A: [m, n]
+    return: [m, n]
+    """
+    A_svd = A.float() if A.dtype in (torch.float16, torch.bfloat16) else A
+    U, S, Vh = torch.linalg.svd(A_svd, full_matrices=False)
+    r = int((S > delta).sum().item())
+    if r == 0:
+        G = torch.zeros_like(A_svd)
+    else:
+        G = U[:, :r] @ Vh[:r, :]
+    return G.to(A.dtype) if A.dtype in (torch.float16, torch.bfloat16) else G
+
+
 class OLEAttention(timm.models.vision_transformer.Attention):
     def __init__(self, *args, layer_index=0, ole_config=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -29,16 +116,27 @@ class OLEAttention(timm.models.vision_transformer.Attention):
         self.layer_index = layer_index
         self.ole_mode = ole_config.get("ole_mode", "none")
         self.ole_lambda_sum = ole_config.get("ole_lambda_sum", 1.0)
-        self.ole_solver_step_size = ole_config.get("ole_solver_step_size", 0.1)
-        self.ole_solver_second_order = ole_config.get("ole_solver_second_order", False)
+
+        # 改小：更接近 notebook 里的 one-step inner lr
+        self.ole_solver_step_size = ole_config.get("ole_solver_step_size", 1e-3)
+
         self.nuclear_norm_mode = ole_config.get("nuclear_norm_mode", "exact")
+        self.ole_nuclear_rank = ole_config.get("ole_nuclear_rank", 8)
         self.ole_log_head_stats = ole_config.get("ole_log_head_stats", False)
         self.selected_layers = set(ole_config.get("ole_layers", []))
+        self.ole_subgrad_delta = ole_config.get("ole_subgrad_delta", 1e-6)
+
+        # alternating-style: solve T on fixed current features
+        self.ole_detach_solver_features = ole_config.get("ole_detach_solver_features", True)
+        # 每多少个 train forward 更新一次 T
+        self.ole_update_interval = max(1, int(ole_config.get("ole_update_interval", 1)))
 
         self._ole_enabled = self.ole_mode != "none" and self.layer_index in self.selected_layers
         self.last_ole_loss = None
         self.last_ole_stats = {}
         self.last_out_heads = None
+        self.last_t_eff = None
+        self.register_buffer("_ole_forward_count", torch.zeros((), dtype=torch.long), persistent=False)
 
         if self._ole_enabled:
             eye = torch.eye(self.head_dim)
@@ -47,67 +145,160 @@ class OLEAttention(timm.models.vision_transformer.Attention):
         else:
             self.register_parameter("ole_t", None)
 
-    def _compute_layer_ole(self, out_heads: torch.Tensor, t_eff: torch.Tensor) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    # Build matrices in CCCP / OLT convention:
+    # each head is one "class"
+    #   Y_h in R^{D x (B*N)}
+    # all heads concatenated by columns:
+    #   Y   in R^{D x (H*B*N)}
+    # ------------------------------------------------------------------
+    def _build_head_matrices(self, out_heads: torch.Tensor):
+        # out_heads: [B, H, N, D]
         b, h, n, d = out_heads.shape
-        transformed = torch.matmul(out_heads, t_eff.transpose(0, 1))
-        x = transformed.permute(1, 0, 2, 3).reshape(h, b * n, d)
-        head_terms = torch.stack([nuclear_norm_fn(xi, mode=self.nuclear_norm_mode) for xi in x], dim=0)
-        x_sum = x.sum(dim=0)
-        sum_term = nuclear_norm_fn(x_sum, mode=self.nuclear_norm_mode)
+
+        # [H, D, B*N]
+        y_heads = out_heads.permute(1, 3, 0, 2).contiguous().reshape(h, d, b * n)
+
+        # [D, H*B*N]
+        y_all = y_heads.permute(1, 0, 2).contiguous().reshape(d, h * b * n)
+
+        return y_heads, y_all
+
+    def _compute_layer_ole_from_mats(
+        self,
+        y_heads: torch.Tensor,   # [H, D, B*N]
+        y_all: torch.Tensor,     # [D, H*B*N]
+        t_eff: torch.Tensor,     # [D, D]
+    ) -> torch.Tensor:
+        ty_heads = torch.matmul(t_eff.unsqueeze(0), y_heads)   # [H, D, B*N]
+
+        head_terms = torch.stack(
+            [
+                nuclear_norm_fn(
+                    ty_heads[i],
+                    mode=self.nuclear_norm_mode,
+                    approx_rank=self.ole_nuclear_rank,
+                )
+                for i in range(ty_heads.shape[0])
+            ],
+            dim=0,
+        )
+
+        union_term = nuclear_norm_fn(
+            t_eff @ y_all,
+            mode=self.nuclear_norm_mode,
+            approx_rank=self.ole_nuclear_rank,
+        )
+
         if self.ole_log_head_stats:
+            x = ty_heads.permute(0, 2, 1).contiguous()  # [H, B*N, D]
+            centered_cos = centered_mean_pairwise_cosine(x.detach())
             self.last_ole_stats = {
                 "head_nuclear": head_terms.mean().detach().item(),
-                "sum_nuclear": sum_term.detach().item(),
-                "head_cosine": mean_pairwise_cosine(x.detach()).item(),
+                "union_nuclear": union_term.detach().item(),
+                "head_cosine": centered_cos.item(),
+                "head_centered_cosine": centered_cos.item(),
             }
-        return head_terms.sum() - sum_term
-        # return head_terms.mean() - self.ole_lambda_sum * sum_term
-    
+
+        return head_terms.sum() - self.ole_lambda_sum * union_term
+
+    def _compute_layer_ole(self, out_heads: torch.Tensor, t_eff: torch.Tensor) -> torch.Tensor:
+        y_heads, y_all = self._build_head_matrices(out_heads)
+        return self._compute_layer_ole_from_mats(y_heads, y_all, t_eff)
+
+    # ------------------------------------------------------------------
+    # One-step CCCP update without spectral normalization
+    #
+    # objective:
+    #   J(T) = sum_h ||T Y_h||_* - lambda ||T Y||_*
+    #
+    # CCCP surrogate at current T^(t):
+    #   J_sur(T; T^(t)) = sum_h ||T Y_h||_* - trace(M^T T)
+    # where
+    #   M = lambda * G_A * Y^T
+    #   G_A in ∂||T^(t)Y||_*
+    #
+    # We do ONLY ONE gradient step on this surrogate.
+    # ------------------------------------------------------------------
+    def _cccp_one_step(self, out_heads: torch.Tensor, t_base: torch.Tensor) -> torch.Tensor:
+        solver_heads = out_heads.detach() if self.ole_detach_solver_features else out_heads
+        y_heads, y_all = self._build_head_matrices(solver_heads)  # [H,D,BN], [D,HBN]
+
+        # 1) linearize the concave term at current T^(t)
+        with torch.no_grad():
+            a_all = t_base.detach() @ y_all                                   # [D, HBN]
+            g_a = nuclear_norm_subgrad(a_all, delta=self.ole_subgrad_delta)   # [D, HBN]
+            m = self.ole_lambda_sum * (g_a @ y_all.transpose(0, 1))           # [D, D]
+
+            # 2) explicit subgradient for sum_h ||T Y_h||_* term:
+            #    if G_h in ∂||T Y_h||_*, then
+            #      ∂_T ||T Y_h||_* contains G_h Y_h^T
+            grad_within = torch.zeros_like(t_base)
+            for i in range(y_heads.shape[0]):
+                a_h = t_base.detach() @ y_heads[i]                            # [D, BN]
+                g_h = nuclear_norm_subgrad(a_h, delta=self.ole_subgrad_delta) # [D, BN]
+                grad_within = grad_within + (g_h @ y_heads[i].transpose(0, 1))
+
+            # surrogate gradient:
+            #   ∂_T [sum_h ||T Y_h||_* - trace(M^T T)] = grad_within - M
+            grad_t = grad_within - m
+
+            # no spectral normalization
+            t_eff = t_base.detach() - self.ole_solver_step_size * grad_t
+
+        return t_eff.to(t_base.dtype)
+
+    def _should_update_t_this_forward(self) -> bool:
+        return bool((self._ole_forward_count.remainder(self.ole_update_interval) == 0).item())
+
     def _get_t_eff(self, out_heads: torch.Tensor):
         if not self._ole_enabled:
             return None, None
-        t_base = spectral_normalize_matrix(self.ole_t)
+
+        # 取消 spectral normalization，直接用当前参数
+        t_base = self.ole_t
+
         if self.ole_mode == "learned_t":
             return t_base, self._compute_layer_ole(out_heads, t_base)
+
         if self.ole_mode == "solver_t":
-            # In eval/no_grad paths (e.g. validation), autograd.grad is unavailable.
-            # Fallback to base transform while still reporting the auxiliary objective.
-            if (not torch.is_grad_enabled()) or (not out_heads.requires_grad):
+            # eval/test: directly use stored T
+            if (not self.training) or (not torch.is_grad_enabled()):
                 return t_base, self._compute_layer_ole(out_heads, t_base)
 
-            local_obj = self._compute_layer_ole(out_heads, t_base)
-            grad_t = torch.autograd.grad(
-                local_obj,
-                t_base,
-                retain_graph=True,
-                create_graph=self.ole_solver_second_order,
-                allow_unused=False,
-            )[0]
-            grad_t_used = grad_t if self.ole_solver_second_order else grad_t.detach()
-            t_eff = spectral_normalize_matrix(t_base - self.ole_solver_step_size * grad_t_used)
-            return t_eff, self._compute_layer_ole(out_heads, t_eff)
-        raise ValueError(f"Unsupported ole_mode: {self.ole_mode}")
-    
+            should_update = self._should_update_t_this_forward()
+            self._ole_forward_count.add_(1)
 
-    # def _get_t_eff(self, out_heads: torch.Tensor):
-    #     if not self._ole_enabled:
-    #         return None, None
-    #     t_base = spectral_normalize_matrix(self.ole_t)
-    #     if self.ole_mode == "learned_t":
-    #         return t_base, self._compute_layer_ole(out_heads, t_base)
-    #     if self.ole_mode == "solver_t":
-    #         local_obj = self._compute_layer_ole(out_heads, t_base)
-    #         grad_t = torch.autograd.grad(
-    #             local_obj,
-    #             t_base,
-    #             retain_graph=True,
-    #             create_graph=self.ole_solver_second_order,
-    #             allow_unused=False,
-    #         )[0]
-    #         grad_t_used = grad_t if self.ole_solver_second_order else grad_t.detach()
-    #         t_eff = spectral_normalize_matrix(t_base - self.ole_solver_step_size * grad_t_used)
-    #         return t_eff, self._compute_layer_ole(out_heads, t_eff)
-    #     raise ValueError(f"Unsupported ole_mode: {self.ole_mode}")
+            if should_update:
+                t_eff = self._cccp_one_step(out_heads, t_base)
+
+                with torch.no_grad():
+                    self.ole_t.copy_(t_eff.detach())
+
+                self.last_t_eff = t_eff.detach()
+                t_use = t_eff.detach()
+            else:
+                self.last_t_eff = t_base.detach()
+                t_use = t_base.detach()
+
+            layer_ole = self._compute_layer_ole(out_heads, t_use)
+            return t_use, layer_ole
+
+        raise ValueError(f"Unsupported ole_mode: {self.ole_mode}")
+
+    def commit_last_t_eff(self):
+        """
+        Keep for compatibility.
+        Since we already write back self.ole_t every train step in solver_t mode,
+        this function mainly acts as a final safeguard.
+        """
+        if (not self._ole_enabled) or (self.ole_mode != "solver_t") or (self.last_t_eff is None):
+            return False
+
+        with torch.no_grad():
+            self.ole_t.copy_(self.last_t_eff)
+
+        return True
 
     def forward(self, x: torch.Tensor, attn_mask=None) -> torch.Tensor:
         B, N, _ = x.shape
@@ -131,11 +322,15 @@ class OLEAttention(timm.models.vision_transformer.Attention):
 
         if self._ole_enabled:
             t_eff, layer_ole = self._get_t_eff(out_heads)
+
+            # use the updated T on current batch
             out_heads = torch.matmul(out_heads, t_eff.transpose(0, 1))
+
             self.last_ole_loss = layer_ole
         else:
             self.last_ole_loss = None
             self.last_ole_stats = {}
+
         self.last_out_heads = out_heads.detach()
 
         x = out_heads.transpose(1, 2).reshape(B, N, self.attn_dim)
@@ -165,11 +360,23 @@ class OLEBlock(timm.models.vision_transformer.Block):
 
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
     """Vision Transformer with support for global average pooling + optional OLE attention."""
-    def __init__(self, global_pool=False, ole_mode="none", ole_loss_weight=0.0, ole_lambda_sum=1.0,
-                 ole_layers="last3", ole_solver_step_size=0.1, ole_solver_second_order=False,
-                 ole_log_head_stats=False, nuclear_norm_mode="exact", **kwargs):
+
+    def __init__(
+        self,
+        global_pool=False,
+        ole_mode="none",
+        ole_loss_weight=0.0,
+        ole_lambda_sum=1.0,
+        ole_layers="all",
+        ole_solver_step_size=0.1,
+        ole_solver_second_order=False,
+        ole_log_head_stats=False,
+        nuclear_norm_mode="exact",
+        ole_update_interval=1,
+        ole_nuclear_rank=8,
+        **kwargs,
+    ):
         depth = kwargs.get("depth", 12)
-        num_heads = kwargs.get("num_heads", 12)
         embed_dim = kwargs.get("embed_dim", 768)
         selected_layers = self._parse_ole_layers(ole_layers, depth)
         ole_cfg = {
@@ -180,6 +387,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             "ole_log_head_stats": ole_log_head_stats,
             "ole_layers": selected_layers,
             "nuclear_norm_mode": nuclear_norm_mode,
+            "ole_update_interval": ole_update_interval,
+            "ole_nuclear_rank": ole_nuclear_rank,
         }
         super(VisionTransformer, self).__init__(
             block_fn=partial(OLEBlock, ole_config=ole_cfg),
@@ -216,6 +425,17 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
     def get_ole_head_stats(self):
         return self.ole_head_stats
+
+    def commit_solver_t(self):
+        """
+        Commit the LAST train-time t_eff into self.ole_t for all OLE-attention blocks.
+        Call once after training, before final eval/test.
+        """
+        committed = 0
+        for blk in self.blocks:
+            if hasattr(blk, "attn") and hasattr(blk.attn, "commit_last_t_eff"):
+                committed += int(blk.attn.commit_last_t_eff())
+        return committed
 
     def forward_head(self, x, pre_logits: bool = False):
         if hasattr(self, "fc_norm"):
@@ -260,34 +480,69 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
 def vit_tiny_patch16(**kwargs):
     model = VisionTransformer(
-        patch_size=16, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        patch_size=16,
+        embed_dim=192,
+        depth=12,
+        num_heads=3,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs,
+    )
     return model
 
 
 def vit_small_patch16(**kwargs):
     model = VisionTransformer(
-        patch_size=16, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        patch_size=16,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs,
+    )
     return model
 
 
 def vit_base_patch16(**kwargs):
     model = VisionTransformer(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs,
+    )
     return model
 
 
 def vit_large_patch16(**kwargs):
     model = VisionTransformer(
-        patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        patch_size=16,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs,
+    )
     return model
 
 
 def vit_huge_patch14(**kwargs):
     model = VisionTransformer(
-        patch_size=14, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        patch_size=14,
+        embed_dim=1280,
+        depth=32,
+        num_heads=16,
+        mlp_ratio=4,
+        qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        **kwargs,
+    )
     return model

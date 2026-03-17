@@ -87,6 +87,8 @@ def get_args_parser():
     parser.add_argument('--ole_solver_second_order', action='store_true')
     parser.add_argument('--ole_log_head_stats', action='store_true')
     parser.add_argument('--nuclear_norm_mode', default='exact', type=str)
+    parser.add_argument('--ole_update_interval', default=1, type=int)
+    parser.add_argument('--ole_nuclear_rank', default=8, type=int)
     return parser
 
 parser = get_args_parser()
@@ -164,6 +166,8 @@ def main_worker(gpu, ngpus_per_node, args):
             ole_solver_second_order=args.ole_solver_second_order,
             ole_log_head_stats=args.ole_log_head_stats,
             nuclear_norm_mode=args.nuclear_norm_mode,
+            ole_update_interval=args.ole_update_interval,
+            ole_nuclear_rank=args.ole_nuclear_rank,
         )
     elif args.arch == 'vit_small':
         model = vit_small_patch16(
@@ -176,6 +180,8 @@ def main_worker(gpu, ngpus_per_node, args):
             ole_solver_second_order=args.ole_solver_second_order,
             ole_log_head_stats=args.ole_log_head_stats,
             nuclear_norm_mode=args.nuclear_norm_mode,
+            ole_update_interval=args.ole_update_interval,
+            ole_nuclear_rank=args.ole_nuclear_rank,
         )
     elif args.arch == 'CRATE_tiny':
         model = CRATE_tiny()
@@ -203,12 +209,19 @@ def main_worker(gpu, ngpus_per_node, args):
                 # ourselves based on the total number of GPUs of the current node.
                 args.batch_size = int(args.batch_size / ngpus_per_node)
                 args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+                model = torch.nn.parallel.DistributedDataParallel(
+                    model,
+                    device_ids=[args.gpu],
+                    find_unused_parameters=True,
+                )
             else:
                 model.cuda()
                 # DistributedDataParallel will divide and allocate batch_size to all
                 # available GPUs if device_ids are not set
-                model = torch.nn.parallel.DistributedDataParallel(model)
+                model = torch.nn.parallel.DistributedDataParallel(
+                    model,
+                    find_unused_parameters=True,
+                )
     elif args.gpu is not None and torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
@@ -220,13 +233,12 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             model = torch.nn.DataParallel(model).cuda()
 
-    if torch.cuda.is_available():
-        if args.gpu:
-            device = torch.device('cuda:{}'.format(args.gpu))
-        else:
-            device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+    # Keep train/val tensors on the same device as the (possibly wrapped) model.
+    device = next(model.parameters()).device
+    if torch.cuda.is_available() and device.type != "cuda":
+        device = torch.device("cuda" if args.gpu is None else f"cuda:{args.gpu}")
+        model = model.to(device)
+
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = LabelSmoothingCrossEntropy(smoothing=args.label_smooth).to(device)
 
@@ -349,6 +361,9 @@ def main_worker(gpu, ngpus_per_node, args):
                 'scheduler' : scheduler.state_dict()
             }, is_best)
 
+    if args.distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
 grad_clip_norm = 1.0
 def train(train_loader, model, criterion, optimizer, epoch, device, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -418,10 +433,9 @@ def validate(val_loader, model, criterion, args):
             end = time.time()
             for i, (images, target) in enumerate(loader):
                 i = base_progress + i
-                if args.gpu is not None and torch.cuda.is_available():
-                    images = images.cuda(args.gpu, non_blocking=True)
-                if torch.cuda.is_available():
-                    target = target.cuda(args.gpu, non_blocking=True)
+                model_device = next(model.parameters()).device
+                images = images.to(model_device, non_blocking=True)
+                target = target.to(model_device, non_blocking=True)
 
                 # compute output
                 output = model(images)
