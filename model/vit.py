@@ -17,14 +17,15 @@ from model.ole_utils import spectral_normalize_matrix
 
 
 def nuclear_norm_fn(matrix: torch.Tensor, mode: str = "exact", eps: float = 1e-8, approx_rank: int = 8) -> torch.Tensor:
-    orig_dtype = matrix.dtype
+    # Keep a stable local dtype alias so cast-back never depends on outer scope edits.
+    return_dtype = matrix.dtype
 
     if mode == "exact":
         # torch.linalg.svdvals is not implemented for float16 on some CUDA backends.
         matrix_svd = matrix.float() if matrix.dtype in (torch.float16, torch.bfloat16) else matrix
         svals = torch.linalg.svdvals(matrix_svd)
         norm = svals.sum() / math.sqrt(matrix.shape[1] + eps)
-        return norm.to(orig_dtype) if orig_dtype in (torch.float16, torch.bfloat16) else norm
+        return norm.to(return_dtype) if return_dtype in (torch.float16, torch.bfloat16) else norm
 
     if mode == "approx":
         # Run randomized range finder + QR/SVD in FP32 to avoid Half geqrf limitation,
@@ -40,7 +41,7 @@ def nuclear_norm_fn(matrix: torch.Tensor, mode: str = "exact", eps: float = 1e-8
             b = q.transpose(0, 1) @ matrix_fp32
             svals = torch.linalg.svdvals(b)
             norm = svals.sum() / math.sqrt(matrix.shape[1] + eps)
-        return norm.to(orig_dtype) if orig_dtype in (torch.float16, torch.bfloat16) else norm
+        return norm.to(return_dtype) if return_dtype in (torch.float16, torch.bfloat16) else norm
 
     raise ValueError(f"Unsupported nuclear norm mode: {mode}")
 
